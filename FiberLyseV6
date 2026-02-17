@@ -62,21 +62,19 @@ DEFAULT_SLOPE_TEST_MAX_N = 5000
 DEFAULT_ACQ_FPS_HZ = 40.0
 DEFAULT_BUTTER_ORDER = 2
 
-# Smoothing window (samples)
-DEFAULT_SMOOTH_WINDOW = 10  # in samples (per excitatory series)
+# Smoothing window (samples, on the current displayed normalization series)
+DEFAULT_SMOOTH_WINDOW = 10  # per excitatory series samples
 
-# Defaults for batch-like z-score parameters (GUI time axis is seconds)
-DEFAULT_ZWIN_START_S = 0.0
-DEFAULT_ZWIN_END_S = 6500.0
-DEFAULT_BASELINE_START_S = 0.0
-DEFAULT_BASELINE_END_S = 600.0  # 10 min
+# Defaults for interval-based z-score parameters (GUI time axis is seconds)
+DEFAULT_ZF_INTERVAL_START_S = 0.0
+DEFAULT_ZF_INTERVAL_END_S = 6500.0
 
 # Normalization UI choices
 NORM_DFF = "ΔF/F"
 NORM_ZF_GLOBAL = "zF (global, GUI)"
-NORM_ZF_WINDOWED = "zF (windowed, batch)"
-NORM_ZF_BASELINE = "zF (baseline corrected, batch)"
-NORM_CHOICES = [NORM_DFF, NORM_ZF_GLOBAL, NORM_ZF_WINDOWED, NORM_ZF_BASELINE]
+NORM_ZF_INTERVAL = "zF - interval based"
+
+NORM_CHOICES = [NORM_DFF, NORM_ZF_GLOBAL, NORM_ZF_INTERVAL]
 
 # Frequency bands (low, high) in Hz
 FREQ_BANDS: List[Tuple[float, float]] = [
@@ -103,7 +101,7 @@ def detect_artifacts_by_derivative(
     t: np.ndarray,
     y: np.ndarray,
     factor: float,
-    method: str = "sd",     # "sd" or "mad"
+    method: str = "sd",  # "sd" or "mad"
     pad: int = 1,
 ) -> np.ndarray:
     """
@@ -381,7 +379,7 @@ def align_iso_to_exc_no_interp(
         j = idx
     elif mode == "nearest":
         j_prev = np.clip(idx - 1, 0, len(t_iso) - 1)
-        j_next = np.clip(idx,     0, len(t_iso) - 1)
+        j_next = np.clip(idx, 0, len(t_iso) - 1)
         d_prev = np.abs(t_exc - t_iso[j_prev])
         d_next = np.abs(t_exc - t_iso[j_next])
         j = np.where(d_next < d_prev, j_next, j_prev)
@@ -544,7 +542,18 @@ def zscore_global_gui(dff: np.ndarray, ddof: int = 0) -> np.ndarray:
     return np.full_like(dff, np.nan, dtype=float)
 
 
-def zscore_windowed_batch(dff: np.ndarray, t: np.ndarray, start_s: float, end_s: float, ddof: int = 1) -> np.ndarray:
+def zscore_interval_based(
+    dff: np.ndarray,
+    t: np.ndarray,
+    start_s: float,
+    end_s: float,
+    ddof: int = 1,
+) -> np.ndarray:
+    """
+    "Interval based" z-score:
+      - compute mean/std from ΔF/F only inside [start_s, end_s]
+      - apply those stats to the whole trace
+    """
     dff = np.asarray(dff, dtype=float)
     t = np.asarray(t, dtype=float)
 
@@ -553,25 +562,7 @@ def zscore_windowed_batch(dff: np.ndarray, t: np.ndarray, start_s: float, end_s:
 
     mask = (t >= a) & (t <= b) & np.isfinite(dff)
     if mask.sum() < 2:
-        mask = np.isfinite(dff)
-
-    mu = float(np.nanmean(dff[mask])) if mask.any() else np.nan
-    sigma = _nanstd_safe(dff[mask], ddof=ddof) if mask.any() else np.nan
-
-    if np.isfinite(sigma) and sigma > 1e-12:
-        return (dff - mu) / sigma
-    return np.full_like(dff, np.nan, dtype=float)
-
-
-def zscore_baseline_batch(dff: np.ndarray, t: np.ndarray, base_start_s: float, base_end_s: float, ddof: int = 1) -> np.ndarray:
-    dff = np.asarray(dff, dtype=float)
-    t = np.asarray(t, dtype=float)
-
-    a = float(min(base_start_s, base_end_s))
-    b = float(max(base_start_s, base_end_s))
-
-    mask = (t >= a) & (t <= b) & np.isfinite(dff)
-    if mask.sum() < 2:
+        # safety fallback: if interval has too few points
         mask = np.isfinite(dff)
 
     mu = float(np.nanmean(dff[mask])) if mask.any() else np.nan
@@ -617,25 +608,27 @@ class ChannelResult:
     dF: np.ndarray
     dFF: np.ndarray
 
-    # smoothing parameter (applies to ANY normalization view)
+    # display smoothing parameter (applies to whatever is shown in Normalization tab)
     smooth_window: int
 
-    # z-score parameters (stored per channel)
-    zwin_start_s: float
-    zwin_end_s: float
-    baseline_start_s: float
-    baseline_end_s: float
+    # interval-based zF parameters
+    zf_interval_start_s: float
+    zf_interval_end_s: float
 
     # z-score variants
     zF_global: np.ndarray
-    zF_windowed: np.ndarray
-    zF_baseline: np.ndarray
+    zF_interval: np.ndarray
 
 
 def recompute_normalizations(res: ChannelResult) -> None:
     res.zF_global = zscore_global_gui(res.dFF, ddof=0)
-    res.zF_windowed = zscore_windowed_batch(res.dFF, res.t_exc, res.zwin_start_s, res.zwin_end_s, ddof=1)
-    res.zF_baseline = zscore_baseline_batch(res.dFF, res.t_exc, res.baseline_start_s, res.baseline_end_s, ddof=1)
+    res.zF_interval = zscore_interval_based(
+        res.dFF,
+        res.t_exc,
+        start_s=res.zf_interval_start_s,
+        end_s=res.zf_interval_end_s,
+        ddof=1,  # "batch-like" sample std
+    )
 
 
 def recompute_fit_and_downstream(res: ChannelResult) -> None:
@@ -644,7 +637,7 @@ def recompute_fit_and_downstream(res: ChannelResult) -> None:
       - fit (exc ≈ a*iso + b) within fit windows
       - residual (ΔF)
       - ΔF/F
-      - all z-score variants
+      - zF variants
     """
     t_exc = res.t_exc
     exc = res.exc_clean
@@ -699,10 +692,8 @@ def analyze_csv(
     fit_windows: List[Tuple[float, float]],
     acq_fps_hz: Optional[float],
     smooth_window: int,
-    zwin_start_s: float,
-    zwin_end_s: float,
-    baseline_start_s: float,
-    baseline_end_s: float,
+    zf_interval_start_s: float,
+    zf_interval_end_s: float,
 ) -> Dict[str, ChannelResult]:
     df = pd.read_csv(csv_path)
 
@@ -791,13 +782,10 @@ def analyze_csv(
             dF=np.full_like(t_exc, np.nan, dtype=float),
             dFF=np.full_like(t_exc, np.nan, dtype=float),
             smooth_window=max(1, int(smooth_window)),
-            zwin_start_s=float(zwin_start_s),
-            zwin_end_s=float(zwin_end_s),
-            baseline_start_s=float(baseline_start_s),
-            baseline_end_s=float(baseline_end_s),
+            zf_interval_start_s=float(zf_interval_start_s),
+            zf_interval_end_s=float(zf_interval_end_s),
             zF_global=np.full_like(t_exc, np.nan, dtype=float),
-            zF_windowed=np.full_like(t_exc, np.nan, dtype=float),
-            zF_baseline=np.full_like(t_exc, np.nan, dtype=float),
+            zF_interval=np.full_like(t_exc, np.nan, dtype=float),
         )
 
         recompute_fit_and_downstream(res)
@@ -877,7 +865,7 @@ class ChannelTabsTk(ttk.Frame):
         self.tab_resid = PlotTabTk(self.tabs, "Residual", prefix)
         self.tab_df = PlotTabTk(self.tabs, "DeltaF", prefix)
 
-        # Normalization tabs (always exist; content changes with dropdown)
+        # Normalization tabs (content changes with dropdown)
         self.tab_norm = PlotTabTk(self.tabs, "Normalization", prefix)
         self.tab_norm_smooth = PlotTabTk(self.tabs, "Normalization_smoothed", prefix)
 
@@ -893,10 +881,8 @@ class ChannelTabsTk(ttk.Frame):
             return "ΔF/F", "ΔF/F smoothed"
         if self.norm_mode == NORM_ZF_GLOBAL:
             return "zF (global)", "zF smoothed"
-        if self.norm_mode == NORM_ZF_WINDOWED:
-            return "zF (windowed)", "zF smoothed"
-        if self.norm_mode == NORM_ZF_BASELINE:
-            return "zF (baseline)", "zF smoothed"
+        if self.norm_mode == NORM_ZF_INTERVAL:
+            return "zF - interval based", "zF smoothed"
         return "Normalization", "Smoothed"
 
     def _configure_tabs(self):
@@ -912,12 +898,12 @@ class ChannelTabsTk(ttk.Frame):
         self.tabs.add(self.tab_resid, text="Residual")
         self.tabs.add(self.tab_df, text="ΔF")
 
-        # Always show the normalization and the smoothed normalization tab
+        # Always show normalization + smoothed normalization
         norm_txt, smooth_txt = self._norm_tab_texts()
         self.tabs.add(self.tab_norm, text=norm_txt)
         self.tabs.add(self.tab_norm_smooth, text=smooth_txt)
 
-        # Only show freq analysis for ΔF/F view (it is defined on ΔF/F)
+        # Only show freq analysis for ΔF/F view (defined on ΔF/F)
         if self.norm_mode == NORM_DFF:
             self.tabs.add(self.tab_freq, text="Freq Analysis")
 
@@ -1055,11 +1041,23 @@ class ChannelTabsTk(ttk.Frame):
         ax.plot(self.res.t_iso, self.res.iso_clean, linewidth=1.2, label="Iso cleaned (holes)")
 
         if np.any(self.res.art_exc):
-            ax.scatter(self.res.t_exc[self.res.art_exc], self.res.exc_raw[self.res.art_exc],
-                       s=12, color="red", label="Shared artifacts", zorder=5)
+            ax.scatter(
+                self.res.t_exc[self.res.art_exc],
+                self.res.exc_raw[self.res.art_exc],
+                s=12,
+                color="red",
+                label="Shared artifacts",
+                zorder=5,
+            )
         if np.any(self.res.art_iso):
-            ax.scatter(self.res.t_iso[self.res.art_iso], self.res.iso_raw[self.res.art_iso],
-                       s=12, color="red", label="_nolegend_", zorder=5)
+            ax.scatter(
+                self.res.t_iso[self.res.art_iso],
+                self.res.iso_raw[self.res.art_iso],
+                s=12,
+                color="red",
+                label="_nolegend_",
+                zorder=5,
+            )
 
         ax.set_title(f"{self.res.gcol} - Artifact remover (red=shared)")
         ax.set_xlabel("Time (s)")
@@ -1135,29 +1133,23 @@ class ChannelTabsTk(ttk.Frame):
         Returns:
           y, ylabel, label, title
         """
-        t = self.res.t_exc
         if self.norm_mode == NORM_DFF:
             return self.res.dFF, "ΔF/F", "ΔF/F", f"{self.res.gcol} - ΔF/F"
+
         if self.norm_mode == NORM_ZF_GLOBAL:
             return self.res.zF_global, "zF", "zF (global)", f"{self.res.gcol} - zF (global, GUI)"
-        if self.norm_mode == NORM_ZF_WINDOWED:
-            a = self.res.zwin_start_s
-            b = self.res.zwin_end_s
+
+        if self.norm_mode == NORM_ZF_INTERVAL:
+            a = self.res.zf_interval_start_s
+            b = self.res.zf_interval_end_s
             return (
-                self.res.zF_windowed,
+                self.res.zF_interval,
                 "zF",
-                f"zF (windowed stats: {min(a,b):g}–{max(a,b):g}s)",
-                f"{self.res.gcol} - zF (windowed, batch)",
+                f"zF (interval stats: {min(a,b):g}–{max(a,b):g} s)",
+                f"{self.res.gcol} - zF - interval based",
             )
-        if self.norm_mode == NORM_ZF_BASELINE:
-            a = self.res.baseline_start_s
-            b = self.res.baseline_end_s
-            return (
-                self.res.zF_baseline,
-                "zF",
-                f"zF (baseline stats: {min(a,b):g}–{max(a,b):g}s)",
-                f"{self.res.gcol} - zF (baseline corrected, batch)",
-            )
+
+        # fallback
         return self.res.dFF, "Signal", "Signal", f"{self.res.gcol} - Normalization"
 
     def _draw_norm(self):
@@ -1171,7 +1163,6 @@ class ChannelTabsTk(ttk.Frame):
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(ylabel)
         ax.legend(loc="best")
-
         self.tab_norm.redraw()
 
     def _draw_norm_smooth(self):
@@ -1207,7 +1198,6 @@ class ChannelTabsTk(ttk.Frame):
         ax.set_xlabel("Time (s)")
         ax.set_ylabel(ylabel)
         ax.legend(loc="best")
-
         self.tab_norm_smooth.redraw()
 
     def _draw_frequency(self):
@@ -1318,8 +1308,8 @@ class MainAppTk:
         self.btn_run = ttk.Button(top, text="Run analysis", command=self.run_analysis)
         self.btn_run.grid(row=0, column=2, sticky="e")
 
-        # ------------------ Controls row (analysis settings) ------------------
-        row2 = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        # ------------------ Controls row (analysis + normalization settings) ------------------
+        row2 = ttk.Frame(self.root, padding=(8, 0, 8, 4))
         row2.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Label(row2, text="Artifact method:").grid(row=0, column=0, sticky="w")
@@ -1357,89 +1347,80 @@ class MainAppTk:
         self.spin_smooth_win = ttk.Spinbox(row2, from_=1, to=100000, increment=1, textvariable=self.var_smooth_win, width=8)
         self.spin_smooth_win.grid(row=0, column=13, padx=(6, 0), sticky="w")
 
+        # A second controls row to keep the UI readable (still part of "the other buttons")
+        row3 = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        row3.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(row3, text="Normalization view:").grid(row=0, column=0, sticky="w")
+        self.var_norm = tk.StringVar(value=NORM_DFF)
+        self.cmb_norm = ttk.Combobox(row3, values=NORM_CHOICES, textvariable=self.var_norm, state="readonly", width=24)
+        self.cmb_norm.grid(row=0, column=1, padx=(6, 12), sticky="w")
+        self.cmb_norm.bind("<<ComboboxSelected>>", lambda _e: self.on_norm_mode_changed())
+
+        # Interval controls (only visible when NORM_ZF_INTERVAL is selected)
+        self.lbl_interval = ttk.Label(row3, text="Interval (s):")
+        self.var_interval_start = tk.StringVar(value=str(DEFAULT_ZF_INTERVAL_START_S))
+        self.var_interval_end = tk.StringVar(value=str(DEFAULT_ZF_INTERVAL_END_S))
+        self.spin_interval_start = ttk.Spinbox(row3, from_=-1e9, to=1e9, increment=1.0, textvariable=self.var_interval_start, width=10)
+        self.lbl_interval_to = ttk.Label(row3, text="to")
+        self.spin_interval_end = ttk.Spinbox(row3, from_=-1e9, to=1e9, increment=1.0, textvariable=self.var_interval_end, width=10)
+
+        self.btn_apply_norm = ttk.Button(row3, text="Apply interval", command=self.apply_normalization)
+
+        # Enter key applies interval (nice UX)
+        for w in [self.spin_interval_start, self.spin_interval_end]:
+            w.bind("<Return>", lambda _e: self.apply_normalization())
+
+        # Place them in the grid, but we will hide/show them as needed
+        self.lbl_interval.grid(row=0, column=2, sticky="w")
+        self.spin_interval_start.grid(row=0, column=3, padx=(6, 4), sticky="w")
+        self.lbl_interval_to.grid(row=0, column=4, sticky="w")
+        self.spin_interval_end.grid(row=0, column=5, padx=(4, 12), sticky="w")
+        self.btn_apply_norm.grid(row=0, column=6, sticky="w")
+
+        # Initialize visibility based on default norm mode
+        self.update_norm_controls_visibility()
+
         # ------------------ Outer tabs (one per G channel) ------------------
         self.outer_tabs = ttk.Notebook(self.root)
         self.outer_tabs.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
 
-        # ------------------ Normalization controls (BOTTOM) ------------------
-        norm_row = ttk.Frame(self.root, padding=(8, 6, 8, 6))
-        norm_row.pack(side=tk.BOTTOM, fill=tk.X)
-
-        ttk.Label(norm_row, text="Normalization view:").pack(side=tk.LEFT)
-
-        self.var_norm = tk.StringVar(value=NORM_DFF)
-        self.cmb_norm = ttk.Combobox(norm_row, values=NORM_CHOICES, textvariable=self.var_norm, state="readonly", width=28)
-        self.cmb_norm.pack(side=tk.LEFT, padx=(6, 12))
-        self.cmb_norm.bind("<<ComboboxSelected>>", lambda _e: self.on_norm_mode_changed())
-
-        # Parameter container (we'll show/hide inside based on selected norm mode)
-        self.params_container = ttk.Frame(norm_row)
-        self.params_container.pack(side=tk.LEFT)
-
-        # Z-window frame (only for windowed batch mode)
-        self.frame_zwin = ttk.Frame(self.params_container)
-        ttk.Label(self.frame_zwin, text="Z-window (s):").pack(side=tk.LEFT)
-        self.var_zwin_start = tk.StringVar(value=str(DEFAULT_ZWIN_START_S))
-        self.var_zwin_end = tk.StringVar(value=str(DEFAULT_ZWIN_END_S))
-        self.spin_zwin_start = ttk.Spinbox(self.frame_zwin, from_=-1e9, to=1e9, increment=1.0, textvariable=self.var_zwin_start, width=10)
-        self.spin_zwin_end = ttk.Spinbox(self.frame_zwin, from_=-1e9, to=1e9, increment=1.0, textvariable=self.var_zwin_end, width=10)
-        self.spin_zwin_start.pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Label(self.frame_zwin, text="to").pack(side=tk.LEFT)
-        self.spin_zwin_end.pack(side=tk.LEFT, padx=(4, 0))
-
-        # Baseline frame (only for baseline-corrected batch mode)
-        self.frame_base = ttk.Frame(self.params_container)
-        ttk.Label(self.frame_base, text="Baseline (s):").pack(side=tk.LEFT)
-        self.var_base_start = tk.StringVar(value=str(DEFAULT_BASELINE_START_S))
-        self.var_base_end = tk.StringVar(value=str(DEFAULT_BASELINE_END_S))
-        self.spin_base_start = ttk.Spinbox(self.frame_base, from_=-1e9, to=1e9, increment=1.0, textvariable=self.var_base_start, width=10)
-        self.spin_base_end = ttk.Spinbox(self.frame_base, from_=-1e9, to=1e9, increment=1.0, textvariable=self.var_base_end, width=10)
-        self.spin_base_start.pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Label(self.frame_base, text="to").pack(side=tk.LEFT)
-        self.spin_base_end.pack(side=tk.LEFT, padx=(4, 0))
-
-        # Apply button (only shown when relevant params are shown)
-        self.btn_apply_norm = ttk.Button(self.params_container, text="Apply", command=self.apply_normalization)
-
-        # Make Enter apply (nice UX)
-        for w in [self.spin_zwin_start, self.spin_zwin_end, self.spin_base_start, self.spin_base_end]:
-            w.bind("<Return>", lambda _e: self.apply_normalization())
-
-        # Status bar (very bottom)
+        # ------------------ Status bar (bottom) ------------------
         self.status = tk.StringVar(value="Ready.")
         status_bar = ttk.Label(self.root, textvariable=self.status, relief=tk.SUNKEN, anchor="w")
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-
-        # Initialize visibility based on default norm mode
-        self.update_norm_controls_visibility()
 
         # Optional autorun
         if self.csv_path and autorun:
             self.root.after(0, self.run_analysis)
 
     # ------------------ Normalization control visibility ------------------
-    def update_norm_controls_visibility(self):
+    def _read_norm_mode(self) -> str:
         mode = (self.var_norm.get() or NORM_DFF).strip()
+        return mode if mode in NORM_CHOICES else NORM_DFF
 
-        # Hide everything
-        self.frame_zwin.pack_forget()
-        self.frame_base.pack_forget()
-        self.btn_apply_norm.pack_forget()
+    def update_norm_controls_visibility(self):
+        mode = self._read_norm_mode()
 
-        # Show only what's relevant
-        if mode == NORM_ZF_WINDOWED:
-            self.frame_zwin.pack(side=tk.LEFT)
-            self.btn_apply_norm.pack(side=tk.LEFT, padx=(12, 0))
-        elif mode == NORM_ZF_BASELINE:
-            self.frame_base.pack(side=tk.LEFT)
-            self.btn_apply_norm.pack(side=tk.LEFT, padx=(12, 0))
+        show_interval = (mode == NORM_ZF_INTERVAL)
+
+        if show_interval:
+            self.lbl_interval.grid()
+            self.spin_interval_start.grid()
+            self.lbl_interval_to.grid()
+            self.spin_interval_end.grid()
+            self.btn_apply_norm.grid()
         else:
-            # ΔF/F or zF global => no options shown
-            pass
+            # Hide (but keep their grid positions remembered)
+            self.lbl_interval.grid_remove()
+            self.spin_interval_start.grid_remove()
+            self.lbl_interval_to.grid_remove()
+            self.spin_interval_end.grid_remove()
+            self.btn_apply_norm.grid_remove()
 
     def on_norm_mode_changed(self):
         self.update_norm_controls_visibility()
-        # Changing mode should always apply immediately (switch the view)
+        # Always apply immediately to switch what you see
         self.apply_normalization()
 
     # ------------------ File handling ------------------
@@ -1449,61 +1430,49 @@ class MainAppTk:
             self.csv_path = path
             self.lbl_file.config(text=path)
 
-    # ------------------ Read settings safely ------------------
-    def _read_norm_mode(self) -> str:
-        mode = (self.var_norm.get() or NORM_DFF).strip()
-        return mode if mode in NORM_CHOICES else NORM_DFF
-
-    def _read_norm_params_for_mode(self, mode: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-        """
-        Parse ONLY the params relevant to the current mode.
-        Returns (z0, z1, b0, b1) where unused ones are None.
-        """
-        if mode == NORM_ZF_WINDOWED:
-            z0 = float(self.var_zwin_start.get())
-            z1 = float(self.var_zwin_end.get())
-            return z0, z1, None, None
-        if mode == NORM_ZF_BASELINE:
-            b0 = float(self.var_base_start.get())
-            b1 = float(self.var_base_end.get())
-            return None, None, b0, b1
-        return None, None, None, None
-
     # ------------------ Apply normalization to existing results ------------------
     def apply_normalization(self):
         mode = self._read_norm_mode()
 
+        # Update smoothing window dynamically for display (no rerun required)
+        try:
+            smooth_win = max(1, int(float(self.var_smooth_win.get())))
+        except Exception:
+            smooth_win = DEFAULT_SMOOTH_WINDOW
+
+        interval_start: Optional[float] = None
+        interval_end: Optional[float] = None
+
+        if mode == NORM_ZF_INTERVAL:
+            try:
+                interval_start = float(self.var_interval_start.get())
+                interval_end = float(self.var_interval_end.get())
+            except Exception as e:
+                messagebox.showerror("Invalid interval", f"Could not parse interval start/end:\n\n{e}")
+                return
+
         if not self._results:
-            # No data yet; just update status and return
+            # No data yet; just update status
             if mode == NORM_DFF:
                 self.status.set("Normalization view: ΔF/F")
             elif mode == NORM_ZF_GLOBAL:
-                self.status.set("Normalization view: zF (global)")
-            elif mode == NORM_ZF_WINDOWED:
-                self.status.set("Normalization view: zF (windowed) – enter Z-window values")
-            elif mode == NORM_ZF_BASELINE:
-                self.status.set("Normalization view: zF (baseline) – enter baseline values")
+                self.status.set("Normalization view: zF (global, GUI)")
+            elif mode == NORM_ZF_INTERVAL:
+                self.status.set("Normalization view: zF - interval based (set interval and apply)")
             return
 
-        try:
-            z0, z1, b0, b1 = self._read_norm_params_for_mode(mode)
-        except Exception as e:
-            messagebox.showerror("Invalid normalization settings", f"Could not parse normalization settings:\n\n{e}")
-            return
-
-        # Update ONLY relevant parameters on each channel
+        # Update per-channel parameters and recompute relevant arrays
         for res in self._results.values():
-            if mode == NORM_ZF_WINDOWED and z0 is not None and z1 is not None:
-                res.zwin_start_s = z0
-                res.zwin_end_s = z1
-            elif mode == NORM_ZF_BASELINE and b0 is not None and b1 is not None:
-                res.baseline_start_s = b0
-                res.baseline_end_s = b1
+            res.smooth_window = smooth_win
 
-            # Always recompute z-score arrays so switching is instant
+            if mode == NORM_ZF_INTERVAL and interval_start is not None and interval_end is not None:
+                res.zf_interval_start_s = interval_start
+                res.zf_interval_end_s = interval_end
+
+            # Always recompute so switching is instant and consistent
             recompute_normalizations(res)
 
-        # Tell each channel widget to update tab labels/visibility + redraw
+        # Update tabs per channel
         for widget in self._channel_widgets.values():
             widget.set_norm_mode(mode)
 
@@ -1512,11 +1481,10 @@ class MainAppTk:
             self.status.set("Normalization view: ΔF/F (no extra parameters).")
         elif mode == NORM_ZF_GLOBAL:
             self.status.set("Normalization view: zF (global, GUI) (no extra parameters).")
-        elif mode == NORM_ZF_WINDOWED:
-            # We know z0/z1 parsed successfully
-            self.status.set(f"Normalization view: zF (windowed). Z-window = {min(z0,z1):g}–{max(z0,z1):g} s")
-        elif mode == NORM_ZF_BASELINE:
-            self.status.set(f"Normalization view: zF (baseline corrected). Baseline = {min(b0,b1):g}–{max(b0,b1):g} s")
+        elif mode == NORM_ZF_INTERVAL:
+            a = float(interval_start)
+            b = float(interval_end)
+            self.status.set(f"Normalization view: zF - interval based. Interval = {min(a,b):g}–{max(a,b):g} s")
 
     # ------------------ Analysis run ------------------
     def run_analysis(self):
@@ -1532,16 +1500,13 @@ class MainAppTk:
             align_mode = self.cmb_align.get().strip().lower()
 
             acq_fps = float(self.var_acq_fps.get())
-            smooth_win = int(float(self.var_smooth_win.get()))
-            smooth_win = max(1, smooth_win)
+            smooth_win = max(1, int(float(self.var_smooth_win.get())))
 
             mode = self._read_norm_mode()
 
-            # Read defaults for all; if invalid in hidden fields, they won't break (we set defaults)
-            zwin_start = float(self.var_zwin_start.get()) if str(self.var_zwin_start.get()).strip() else DEFAULT_ZWIN_START_S
-            zwin_end = float(self.var_zwin_end.get()) if str(self.var_zwin_end.get()).strip() else DEFAULT_ZWIN_END_S
-            base_start = float(self.var_base_start.get()) if str(self.var_base_start.get()).strip() else DEFAULT_BASELINE_START_S
-            base_end = float(self.var_base_end.get()) if str(self.var_base_end.get()).strip() else DEFAULT_BASELINE_END_S
+            # Always parse interval values (they are only used if mode == interval-based)
+            interval_start = float(self.var_interval_start.get())
+            interval_end = float(self.var_interval_end.get())
 
         except Exception as e:
             messagebox.showerror("Invalid settings", f"Could not parse settings:\n\n{e}")
@@ -1564,10 +1529,8 @@ class MainAppTk:
                     fit_windows=fit_windows,
                     acq_fps_hz=acq_fps if (np.isfinite(acq_fps) and acq_fps > 0) else None,
                     smooth_window=smooth_win,
-                    zwin_start_s=zwin_start,
-                    zwin_end_s=zwin_end,
-                    baseline_start_s=base_start,
-                    baseline_end_s=base_end,
+                    zf_interval_start_s=interval_start,
+                    zf_interval_end_s=interval_end,
                 )
                 self.root.after(0, lambda: self.on_analysis_finished(results, mode))
             except Exception as e:
@@ -1635,3 +1598,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
