@@ -1,7 +1,12 @@
 # FiberLyse
 Fiber photometry GUI
 
-To install, copy the python code in the FiberLys code and paste in visual studio code, and run it. 
+In your terminal write; 
+ - pip install numpy
+ - pip install pandas
+ - pip install matplotlib
+
+copy the python code in the FiberLys code and paste in visual studio code, and run it. 
 
 # How to use
 1. Upload an CSV file from a neurophotometrics machine
